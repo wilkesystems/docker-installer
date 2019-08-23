@@ -1,0 +1,368 @@
+#!/bin/bash
+set -o pipefail
+set -o errtrace
+set -o nounset
+set -o errexit
+
+IPS=$(ifconfig | sed -En 's/.*inet (addr:)?(([0-9]*\.){3}[0-9]*).*/IP:\2/p')
+
+DOCKER_UID=998
+DOCKER_GID=998
+
+TLS="true"
+
+COUNTRY="US"
+STATE="CA"
+LOCATION="San Francisco"
+ORGANISATION="Docker Inc."
+OU="Server"
+EMAIL="no-reply@docker.com"
+DAYS="1825"
+
+CA_PASSWORD="/etc/docker/tls/ca.txt"
+CA_KEY="/etc/docker/tls/ca-key.pem"
+CA_CERT="/etc/docker/tls/ca.pem"
+
+SERVER_KEY="/etc/docker/tls/server-key.pem"
+SERVER_CSR="/etc/docker/tls/server.csr"
+SERVER_CERT="/etc/docker/tls/server-cert.pem"
+SERVER_CONF="/etc/docker/tls/extfile.cnf"
+
+CLIENT_KEY="/etc/docker/tls/key.pem"
+CLIENT_CSR="/etc/docker/tls/client.csr"
+CLIENT_CERT="/etc/docker/tls/cert.pem"
+CLIENT_CONF="/etc/docker/tls/extfile-client.cnf"
+
+function main {
+    opts="-hp:"
+    long="help,debug,country:,state:,location:,organisation:,ou:,email:,password:,days:,tls,version"
+    args=$(getopt --name "$(basename $0)" --options $opts --long $long -- "$@")
+    eval set --"$args"
+    while true; do
+        case "$1" in
+            --tls )
+                TLS=true
+                shift
+                ;;
+            --country )
+                COUNTRY="$2"
+                shift 2
+                ;;
+            --state )
+                STATE="$2"
+                shift 2
+                ;;
+            --location )
+                LOCATION="$2"
+                shift 2
+                ;;
+            --organisation )
+                ORGANISATION="$2"
+                shift 2
+                ;;
+            --ou )
+                OU="$2"
+                shift 2
+                ;;
+            --email )
+                EMAIL="$2"
+                shift 2
+                ;;
+            --days )
+                DAYS="$2"
+                shift 2
+                ;;
+            -p | --password )
+                PASSWORD="$2"
+                shift 2
+                ;;
+            -h | --help )
+                print_usage
+                shift
+                ;;
+            --debug )
+                DEBUG=true
+                shift
+                ;;
+            --version )
+                print_version
+                shift
+                ;;
+            -- )
+                shift
+                break
+                ;;
+            * )
+                break
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    install_docker
+}
+
+function install_docker {
+    : ${DEBUG=false}
+
+    [ "${DEBUG}" = "true" ] && set -x
+
+    if [ -f /etc/debian_version ] && [ $(sed 's/\..*//' /etc/debian_version) -eq 10 ]; then
+        if [ ! "$(which docker)" ]; then
+            print_message "Install Docker Community Edition ... "
+            if [ $DOCKER_UID ] && [ $DOCKER_UID -ne 0 ]; then
+                adduser -q \
+                        --system \
+                        --disabled-login \
+                        --disabled-password \
+                        --home /var/lib/docker \
+                        --group \
+                        --shell /usr/bin/nologin \
+                        --no-create-home \
+                        --uid $DOCKER_UID \
+                        --gecos "Docker" \
+                docker
+            fi
+            if [ $DOCKER_GID ] && [ $DOCKER_GID -ne 0 ]; then
+                addgroup -q \
+                         --system \
+                         --gid $DOCKER_GID \
+                docker
+            fi
+            apt-get update > /dev/null 2>&1
+            apt-get -y -q install docker.io > /dev/null 2>&1
+            error_status
+            if [ $TLS ]; then
+                install_docker_tls
+            fi
+        fi
+
+        if [ ! "$(which docker-compose)" ]; then
+            print_message "Install Docker Compose ... "
+            apt-get update > /dev/null 2>&1
+            apt-get -y -q install docker-compose > /dev/null 2>&1
+            error_status
+        fi
+    fi
+}
+
+function install_docker_tls {
+    : ${HOSTNAME:=$(hostname --fqdn)}
+    : ${PASSWORD:=$(< /dev/urandom tr -dc A-Za-z0-9 | head -c$(shuf -i 16-32 -n 1); echo)}
+
+    if [ ! -f $CA_KEY ]; then
+        print_message "Generating Docker CA private key ... "
+        mkdir -p $(dirname $CA_KEY)
+        openssl genrsa \
+            -aes256 \
+            -passout pass:$PASSWORD \
+            -out $CA_KEY 4096 \
+        &> /dev/null
+        chmod 0400 $CA_KEY
+        mkdir -p $(dirname $CA_PASSWORD)
+        echo "$PASSWORD" > $CA_PASSWORD
+        chmod 0400 $CA_PASSWORD
+        error_status
+    fi
+
+    if [ ! -f $CA_CERT ]; then
+        print_message "Generating Docker CA certificate ... "
+        mkdir -p $(dirname $CA_CERT)
+        openssl req \
+            -new \
+            -x509 \
+            -days $DAYS \
+            -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANISATION/OU=$OU/CN=$HOSTNAME/emailAddress=$EMAIL" \
+            -key $CA_KEY \
+            -sha256 \
+            -passin pass:$PASSWORD \
+            -out $CA_CERT \
+        &> /dev/null
+        chmod 0444 $CA_CERT
+        error_status
+    fi
+
+    if [ ! -f $SERVER_KEY ]; then
+        print_message "Generating Docker Server private Key ... "
+        mkdir -p $(dirname $SERVER_KEY)
+        openssl genrsa \
+            -out $SERVER_KEY 4096 \
+        &> /dev/null
+        chmod 0400 $SERVER_KEY
+        error_status
+    fi
+
+    if [ ! -f $SERVER_CERT ]; then
+        print_message "Generating Docker Server certificate ... "
+        mkdir -p $(dirname $SERVER_CSR)
+        openssl req \
+            -subj "/CN=$HOSTNAME" \
+            -sha256 \
+            -new \
+            -key $SERVER_KEY \
+            -out $SERVER_CSR \
+        &> /dev/null
+        mkdir -p $(dirname $SERVER_CONF)
+        echo subjectAltName = DNS:$HOSTNAME,$(echo $IPS | sed -e 's/ /,/g') > $SERVER_CONF
+        echo extendedKeyUsage = serverAuth > $SERVER_CONF
+        mkdir -p $(dirname $SERVER_CERT)
+        openssl x509 \
+            -req \
+            -days $DAYS \
+            -sha256 \
+            -passin pass:$PASSWORD \
+            -in $SERVER_CSR \
+            -CA $CA_CERT \
+            -CAkey $CA_KEY \
+            -CAcreateserial \
+            -extfile $SERVER_CONF \
+            -out $SERVER_CERT \
+        &> /dev/null
+        rm $SERVER_CONF $SERVER_CSR
+        chmod 0444 $SERVER_CERT
+        error_status
+    fi
+
+    if [ ! -f $CLIENT_KEY ]; then
+        print_message "Generating Docker Client private Key ... "
+        mkdir -p $(dirname $CLIENT_KEY)
+        openssl genrsa \
+            -out $CLIENT_KEY 4096 \
+        &> /dev/null
+        chmod 0400 $CLIENT_KEY
+        error_status
+    fi
+
+    if [ ! -f $CLIENT_CERT ]; then
+        print_message "Generating Docker Client certificate ... "
+        mkdir -p $(dirname $CLIENT_CSR)
+        openssl req \
+            -subj '/CN=client' \
+            -new \
+            -key $CLIENT_KEY \
+            -out $CLIENT_CSR \
+        &> /dev/null
+        mkdir -p $(dirname $SERVER_CONF)
+        echo extendedKeyUsage = clientAuth > $CLIENT_CONF
+        mkdir -p $(dirname $CLIENT_CERT)
+        openssl x509 \
+            -req \
+            -days $DAYS \
+            -sha256 \
+            -passin pass:$PASSWORD \
+            -in $CLIENT_CSR \
+            -CA $CA_CERT \
+            -CAkey $CA_KEY \
+            -CAcreateserial \
+            -extfile $CLIENT_CONF \
+            -out $CLIENT_CERT \
+        &> /dev/null
+        rm $CLIENT_CONF $CLIENT_CSR
+        chmod 0444 $CLIENT_CERT
+        error_status
+    fi
+
+    if [ -d /etc/docker ] && [ ! -f /etc/docker/daemon.json ]; then
+        DAEMON_JSON_FORMAT="{\"tls\":%s,\"tlscacert\":\"%s\",\"tlscert\":\"%s\",\"tlskey\":\"%s\",\"tlsverify\":%s}"
+        DAEMON_JSON=$(printf "$DAEMON_JSON_FORMAT" "true" "$CA_CERT" "$SERVER_CERT" "$SERVER_KEY" "true")
+        echo $DAEMON_JSON > /etc/docker/daemon.json
+        chmod 0600 /etc/docker/daemon.json
+    fi
+
+    if [ ! -d /root/.docker ]; then
+        mkdir -p /root/.docker
+        cp -p $CA_CERT $CLIENT_CERT $CLIENT_KEY /root/.docker
+    fi
+}
+
+function error_status {
+    if [ $? -eq 0 ]; then
+        print_status OK
+    else
+        print_status ERROR
+        exit
+    fi
+}
+
+function print_message {
+    echo -n "$1"
+}
+
+function print_message {
+    echo -n "$1"
+}
+
+function print_status {
+    case $1 in
+    "OK")
+        COLOR=32m
+        ;;
+    "WARNING")
+        COLOR=33m
+        ;;
+    "ERROR")
+        COLOR=31m
+        ;;
+    *)
+        COLOR=39m
+        ;;
+    esac
+    echo -e "\e[${COLOR}\033[50D\033[$(($(tput cols)-${#1}-5))C[ $1 ]\e[39m"
+}
+
+function print_usage {
+cat << EOF
+Usage: "$(basename $0)" [Options]...
+
+Options:
+      --tls             Use TLS
+
+      --country         Certificate country
+      --state           Certificate state
+      --location        Certificate location
+      --organisation    Certificate organisation
+      --ou              Certificate OU
+      --email           Certificate email
+      --days            Certificate validity in days
+
+  -p  --password        Certificate private key password
+
+  -h  --help            display this help and exit
+
+      --debug           output debug information
+      --version         output version information and exit
+
+E-mail bug reports to: <developer@wilke.systems>.
+EOF
+exit
+}
+
+function print_version {
+cat << EOF
+
+MIT License
+
+Copyright (c) Wilke.Systems
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+EOF
+exit
+}
+
+main "$@"
